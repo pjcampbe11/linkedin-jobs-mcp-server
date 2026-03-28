@@ -1,0 +1,1 @@
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass; python -m venv NAME_OF_VENV; .\NAME_OF_VENV\Scripts\Activate.ps1
