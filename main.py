@@ -18,7 +18,7 @@ def get_client():
     return httpx.Client(headers=headers)
 
 @mcp.tool()
-def search_jobs(keywords: str, limit: int = 10, location: str = 'Israel', format_output: bool = True) -> dict:
+def search_jobs(keywords: str, limit: int = 10, location: str = 'United States', format_output: bool = True) -> dict:
     """
     Search for jobs on LinkedIn and return as a dictionary.
     
