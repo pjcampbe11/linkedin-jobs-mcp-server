@@ -128,7 +128,11 @@ def _parse_posted_at(value: Any) -> Optional[datetime]:
             timestamp /= 1000.0
         return datetime.fromtimestamp(timestamp, tz=timezone.utc)
 
-    iso_candidate = text.replace("Z", "+00:00")
+    # FIX: Strip trailing " UTC" / "+0000 UTC" suffixes the API emits,
+    # e.g. "2026-03-31 03:50:20 +0000 UTC" — fromisoformat chokes on the
+    # trailing " UTC" token even though the offset is already present.
+    iso_candidate = re.sub(r"\s+UTC$", "", text, flags=re.IGNORECASE)
+    iso_candidate = iso_candidate.replace("Z", "+00:00")
     try:
         parsed = datetime.fromisoformat(iso_candidate)
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
@@ -183,6 +187,35 @@ def _normalize_job(job: Dict[str, Any], parsed_posted_at: Optional[datetime]) ->
         "post_date_iso": parsed_posted_at.isoformat() if parsed_posted_at else None,
         "reference_id": job.get("referenceId"),
     }
+
+
+# Terms that must appear in a job title for it to be considered relevant
+# to security/engineering searches. Without this the RapidAPI layer returns
+# wildly unrelated listings (police officers, nurses, water instructors, etc.)
+# alongside legitimate results because LinkedIn's keyword match is very loose.
+_SECURITY_TITLE_TERMS = {
+    # generic engineering / research
+    "engineer", "researcher", "analyst", "architect", "developer", "specialist",
+    "consultant", "scientist", "manager", "director", "lead", "principal",
+    "intern", "associate",
+    # security-specific
+    "security", "red team", "pentest", "penetration", "offensive", "exploit",
+    "malware", "reverse", "detection", "threat", "soc", "siem", "splunk",
+    "vulnerability", "incident", "forensic", "appsec", "devsecops", "secops",
+    "ctf", "purple", "blue team", "hunting", "hunt",
+    # ai/ml
+    "ml", "ai", "llm", "machine learning", "data science", "nlp", "genai",
+    "mlops", "adversarial",
+    # infra / cloud
+    "devops", "cloud", "platform", "infrastructure", "sre", "reliability",
+    "kubernetes", "aws", "gcp", "azure",
+}
+
+
+def _is_relevant_title(title: str) -> bool:
+    """Return True if the job title contains at least one security/tech term."""
+    lower = title.lower()
+    return any(term in lower for term in _SECURITY_TITLE_TERMS)
 
 
 def _age_days_to_api_filter(max_age_days: int) -> str:
@@ -288,6 +321,14 @@ def search_jobs(
                     posted_at_dt = _parse_posted_at(job.get("postAt"))
                     if posted_at_dt is not None:
                         parseable_dates.append(posted_at_dt)
+
+                    # FIX: Drop irrelevant titles. RapidAPI/LinkedIn keyword
+                    # matching is very loose and surfaces nurses, police officers,
+                    # and other unrelated roles alongside security engineering
+                    # jobs. Require at least one tech/security term in the title.
+                    if not _is_relevant_title(job.get("title", "")):
+                        age_filtered_out += 1
+                        continue
 
                     if cutoff is not None:
                         if posted_at_dt is None or posted_at_dt < cutoff:
