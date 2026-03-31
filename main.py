@@ -185,17 +185,35 @@ def _normalize_job(job: Dict[str, Any], parsed_posted_at: Optional[datetime]) ->
     }
 
 
+def _age_days_to_api_filter(max_age_days: int) -> str:
+    """
+    FIX: Map max_age_days to the tightest LinkedIn API datePosted filter
+    that is >= max_age_days, so LinkedIn pre-filters as aggressively as
+    possible before we apply our own cutoff. Previously the code always
+    sent 'anyTime' whenever a cutoff was set, causing LinkedIn to return
+    mostly ancient listings that were then discarded — leaving 0 results.
+    """
+    if max_age_days <= 1:
+        return "past24Hours"
+    elif max_age_days <= 7:
+        return "pastWeek"
+    elif max_age_days <= 30:
+        return "pastMonth"
+    else:
+        return "pastMonth"  # LinkedIn's coarsest filter; local cutoff handles the rest
+
+
 @mcp.tool()
 def search_jobs(
     keywords: str,
     limit: int = 10,
     location: str = "United States",
     format_output: bool = True,
-    max_age_days: int = 60,
+    max_age_days: int = 180,
     onsite_remote: Optional[str] = None,
 ) -> dict:
     """
-    Search LinkedIn jobs with pagination, 60-day filtering, and deduplication.
+    Search LinkedIn jobs with pagination, age filtering, and deduplication.
 
     :param keywords: Job search keywords
     :param limit: Maximum number of job results to return
@@ -212,6 +230,10 @@ def search_jobs(
     if max_age_days and max_age_days > 0:
         cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
 
+    # FIX: Select the tightest LinkedIn-side date filter appropriate for
+    # max_age_days so that the API pre-filters before we paginate.
+    api_date_filter = _age_days_to_api_filter(max_age_days) if cutoff else "pastMonth"
+
     try:
         with get_client() as client:
             location_id = _lookup_location_id(client, location)
@@ -223,13 +245,20 @@ def search_jobs(
             duplicates_removed = 0
             age_filtered_out = 0
             pages_fetched = 0
+            # FIX: Track consecutive pages where every parseable date is older
+            # than the cutoff before giving up, rather than bailing after just one.
+            consecutive_stale_pages = 0
+            MAX_STALE_PAGES = 3
 
             while start <= SEARCH_JOBS_MAX_START and len(jobs) < limit:
                 params = {
                     "keywords": keywords,
                     "locationId": location_id,
-                    "datePosted": "anyTime" if cutoff else "pastMonth",
-                    "sort": "mostRecent" if cutoff else "mostRelevant",
+                    # FIX: Was always "anyTime" when cutoff was set — that's
+                    # backwards. "anyTime" returns the oldest jobs first even
+                    # with sort=mostRecent, flooding results with stale listings.
+                    "datePosted": api_date_filter,
+                    "sort": "mostRecent",
                     "start": start,
                 }
                 if onsite_remote:
@@ -247,6 +276,7 @@ def search_jobs(
 
                 raw_seen += len(batch)
                 parseable_dates: List[datetime] = []
+                page_had_fresh = False
 
                 for job in batch:
                     job_key = _build_job_key(job)
@@ -263,18 +293,32 @@ def search_jobs(
                         if posted_at_dt is None or posted_at_dt < cutoff:
                             age_filtered_out += 1
                             continue
+                        else:
+                            page_had_fresh = True
 
                     jobs.append(_normalize_job(job, posted_at_dt))
                     if len(jobs) >= limit:
                         break
 
-                # /search-jobs documents `start` in 25-result increments; a short page means we're done.
+                # A short page means we've exhausted LinkedIn's results.
                 if len(batch) < SEARCH_JOBS_PAGE_SIZE:
                     break
 
-                # When sorted by recency, stop once an entire parseable page is older than the cutoff.
-                if cutoff is not None and parseable_dates and max(parseable_dates) < cutoff:
-                    break
+                # FIX: Only stop early if several consecutive pages are fully
+                # stale. One stale page is common due to API ordering noise;
+                # stopping after just one page was causing premature exits.
+                if cutoff is not None and parseable_dates and not page_had_fresh:
+                    if max(parseable_dates) < cutoff:
+                        consecutive_stale_pages += 1
+                        if consecutive_stale_pages >= MAX_STALE_PAGES:
+                            logger.debug(
+                                "Stopping: %d consecutive fully-stale pages", MAX_STALE_PAGES
+                            )
+                            break
+                    else:
+                        consecutive_stale_pages = 0
+                else:
+                    consecutive_stale_pages = 0
 
                 start += SEARCH_JOBS_PAGE_SIZE
 
@@ -285,6 +329,7 @@ def search_jobs(
                     "location_id": location_id,
                     "max_age_days": max_age_days,
                     "onsite_remote": onsite_remote,
+                    "api_date_filter": api_date_filter,  # surfaced for debugging
                 },
                 "count": len(jobs),
                 "jobs": jobs,
